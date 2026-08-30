@@ -1,7 +1,6 @@
-import { useState, useCallback } from "react";
-import { useAuthActions, useAuthToken } from "@convex-dev/auth/react";
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
+import { useState, useCallback, useEffect } from "react";
+import { supabase } from "@/lib/supabase";
+import type { Session, User as SupabaseUser } from "@supabase/supabase-js";
 
 export interface UserProfile {
   id: string;
@@ -9,11 +8,12 @@ export interface UserProfile {
   name: string;
   role: UserRole;
   org_unit: string;
+  authMethod: "supabase" | "demo";
 }
 
 export type UserRole = "analyst" | "officer" | "command" | "admin";
 
-// Demo role assignments for anonymous quick-login
+// Demo role assignments for quick-login
 const DEMO_ROLES: Record<string, { role: UserRole; name: string; org_unit: string }> = {
   "analyst@demo.local": { role: "analyst", name: "SOC Analyst", org_unit: "Security Operations" },
   "officer@demo.local": { role: "officer", name: "Security Officer", org_unit: "Security Operations" },
@@ -42,78 +42,98 @@ function saveDemoProfile(profile: UserProfile | null) {
 }
 
 export function useAuth() {
-  const { signIn, signOut } = useAuthActions();
-  const token = useAuthToken();
-  const isAuthenticated = !!token;
+  // Supabase session state
+  const [supabaseSession, setSupabaseSession] = useState<Session | null>(null);
+  const [supabaseLoading, setSupabaseLoading] = useState(true);
+  const [supabaseUser, setSupabaseUser] = useState<SupabaseUser | null>(null);
 
-  // Query the user's Convex profile (returns undefined while loading, null if not found)
-  const convexUser = useQuery(api.socData.getUserRole);
-
-  // Local demo profile for anonymous users — persisted in sessionStorage
+  // Demo profile — persisted in sessionStorage
   const [demoProfile, setDemoProfile] = useState<UserProfile | null>(loadDemoProfile);
+
+  // Listen for Supabase auth state changes
+  useEffect(() => {
+    // Get initial session
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setSupabaseSession(session);
+      setSupabaseUser(session?.user ?? null);
+      setSupabaseLoading(false);
+    });
+
+    // Listen for changes
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setSupabaseSession(session);
+      setSupabaseUser(session?.user ?? null);
+      setSupabaseLoading(false);
+    });
+
+    return () => subscription.unsubscribe();
+  }, []);
+
+  // Determine auth state: Supabase session OR demo session
+  const isSupabaseAuthenticated = !!supabaseSession;
+  const isDemoAuthenticated = !!demoProfile;
+  const isAuthenticated = isSupabaseAuthenticated || isDemoAuthenticated;
+  const isLoading = supabaseLoading;
 
   // Build the effective profile
   let user: UserProfile | null = null;
-  let isLoading = true;
 
-  if (isAuthenticated) {
-    if (convexUser !== undefined) {
-      isLoading = false;
-      if (convexUser && convexUser.role) {
-        // Has a role set in Convex
-        user = {
-          id: convexUser._id,
-          email: convexUser.email ?? "",
-          name: convexUser.name ?? "Unknown User",
-          role: convexUser.role as UserRole,
-          org_unit: convexUser.orgUnitId ?? "Security Operations",
-        };
-      } else if (demoProfile) {
-        // Anonymous user with locally-set demo role
-        user = demoProfile;
-      } else {
-        // Authenticated but no role set — default to analyst for demo
-        user = {
-          id: "anonymous_user",
-          email: "",
-          name: "Demo Analyst",
-          role: "analyst",
-          org_unit: "Security Operations",
-        };
-      }
-    }
-    // Still loading if convexUser is undefined
-  } else {
-    isLoading = false;
+  if (isSupabaseAuthenticated && supabaseUser) {
+    // Supabase email/password user
+    user = {
+      id: supabaseUser.id,
+      email: supabaseUser.email ?? "",
+      name: supabaseUser.user_metadata?.name
+        ?? supabaseUser.email?.split("@")[0]
+        ?? "User",
+      role: (supabaseUser.user_metadata?.role as UserRole) ?? "analyst",
+      org_unit: (supabaseUser.user_metadata?.org_unit as string) ?? "Security Operations",
+      authMethod: "supabase",
+    };
+  } else if (isDemoAuthenticated && demoProfile) {
+    // Demo user (stored in sessionStorage)
+    user = demoProfile;
   }
 
+  // Supabase email/password sign in
   const signInEmail = useCallback(
-    async (_email: string, _password: string) => {
-      // Use Convex Auth email-otp provider — sends OTP to email
-      const result = await signIn("email-otp", { email: _email });
-      if (!result.signingIn) {
-        throw new Error("OTP sent to your email. Please verify.");
-      }
+    async (email: string, password: string) => {
+      const { data, error } = await supabase.auth.signInWithPassword({
+        email,
+        password,
+      });
+      if (error) throw error;
+      if (!data.session) throw new Error("Sign in failed. Please try again.");
     },
-    [signIn]
+    [],
   );
 
+  // Supabase email/password sign up
   const signUp = useCallback(
-    async (email: string, _password: string) => {
-      const result = await signIn("email-otp", { email });
-      if (!result.signingIn) {
-        throw new Error("OTP sent to your email. Please verify.");
+    async (email: string, password: string) => {
+      const { data, error } = await supabase.auth.signUp({
+        email,
+        password,
+        options: {
+          data: {
+            role: "analyst",
+            org_unit: "Security Operations",
+          },
+        },
+      });
+      if (error) throw error;
+      if (data.user && !data.session) {
+        // Email confirmation required
+        return { confirmEmail: true };
       }
+      return { confirmEmail: false };
     },
-    [signIn]
+    [],
   );
 
+  // Demo login — purely session-based, no backend call needed
   const signInDemo = useCallback(
     async (demoEmail: string) => {
-      // Sign in anonymously via Convex Auth
-      await signIn("anonymous");
-
-      // Set the demo role locally for immediate UI rendering
       const roleInfo = DEMO_ROLES[demoEmail] ?? {
         role: "analyst" as UserRole,
         name: demoEmail.split("@")[0],
@@ -126,19 +146,28 @@ export function useAuth() {
         name: roleInfo.name,
         role: roleInfo.role,
         org_unit: roleInfo.org_unit,
+        authMethod: "demo",
       };
 
       setDemoProfile(profile);
       saveDemoProfile(profile);
     },
-    [signIn]
+    [],
   );
 
+  // Sign out
   const handleSignOut = useCallback(async () => {
-    await signOut();
+    // Sign out of Supabase (if signed in via Supabase)
+    if (isSupabaseAuthenticated) {
+      await supabase.auth.signOut();
+      setSupabaseSession(null);
+      setSupabaseUser(null);
+    }
+
+    // Clear demo session
     setDemoProfile(null);
     saveDemoProfile(null);
-  }, [signOut]);
+  }, [isSupabaseAuthenticated]);
 
   return {
     isLoading,
